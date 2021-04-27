@@ -1,8 +1,10 @@
 """Checkout-related utility functions."""
 from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
 
+import graphene
 from django.core.exceptions import ValidationError
-from django.db.models import Sum
+from django.db.models import Count, F, OuterRef, Subquery, Sum
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from prices import Money
 
@@ -165,6 +167,17 @@ def update_checkout_quantity(checkout):
     checkout.quantity = total_lines
     checkout.save(update_fields=["quantity"])
     return checkout
+
+
+def bulk_update_checkout_quantity(checkout_pks):
+    query = (
+        CheckoutLine.objects.filter(checkout_id=OuterRef("pk"))
+        .annotate(sum_quantity=Sum(F("quantity")))
+        .values("sum_quantity")
+    )
+    Checkout.objects.filter(pk__in=checkout_pks).update(
+        quantity=Coalesce(Subquery(query), 0)
+    )
 
 
 def _check_new_checkout_address(checkout, address, address_type):
@@ -651,3 +664,28 @@ def is_shipping_required(lines: Iterable["CheckoutLineInfo"]):
     return any(
         line_info.product.product_type.is_shipping_required for line_info in lines
     )
+
+
+def validate_variants_in_checkout_lines(lines: Iterable["CheckoutLineInfo"]):
+    variants_listings_map = {line.variant.id: line.channel_listing for line in lines}
+
+    not_available_variants = [
+        variant_id
+        for variant_id, channel_listing in variants_listings_map.items()
+        if channel_listing is None or channel_listing.price is None
+    ]
+    if not_available_variants:
+        not_available_variants_ids = {
+            graphene.Node.to_global_id("ProductVariant", pk)
+            for pk in not_available_variants
+        }
+        error_code = CheckoutErrorCode.UNAVAILABLE_VARIANT_IN_CHANNEL
+        raise ValidationError(
+            {
+                "lines": ValidationError(
+                    "Cannot add lines with unavailable variants.",
+                    code=error_code,  # type: ignore
+                    params={"variants": not_available_variants_ids},
+                )
+            }
+        )

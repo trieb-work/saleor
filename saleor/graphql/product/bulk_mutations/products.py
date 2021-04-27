@@ -5,6 +5,8 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 from graphene.types import InputObjectType
 
+from ....checkout import models as checkout_models
+from ....checkout.utils import bulk_update_checkout_quantity
 from ....core.permissions import ProductPermissions, ProductTypePermissions
 from ....order import OrderStatus
 from ....order import models as order_models
@@ -99,6 +101,7 @@ class ProductBulkDelete(ModelBulkDeleteMutation):
         error_type_field = "product_errors"
 
     @classmethod
+    @transaction.atomic
     def perform_mutation(cls, _root, info, ids, **data):
         _, pks = resolve_global_ids_to_primary_keys(ids, Product)
         product_to_variant = list(
@@ -114,6 +117,12 @@ class ProductBulkDelete(ModelBulkDeleteMutation):
         ).values("pk", "order_id")
         line_pks = {line["pk"] for line in lines_id_and_orders_id}
         orders_id = {line["order_id"] for line in lines_id_and_orders_id}
+        checkout_pks = list(
+            checkout_models.Checkout.objects.filter(
+                lines__variant_id__in=variants_ids
+            ).values_list("pk", flat=True)
+        )
+
         response = super().perform_mutation(
             _root,
             info,
@@ -126,6 +135,9 @@ class ProductBulkDelete(ModelBulkDeleteMutation):
         order_models.OrderLine.objects.filter(pk__in=line_pks).delete()
         if orders_id:
             recalculate_orders_task.delay(list(orders_id))
+
+        # update checkout quantity related to deleted lines
+        bulk_update_checkout_quantity(checkout_pks)
 
         return response
 
@@ -531,6 +543,11 @@ class ProductVariantBulkDelete(ModelBulkDeleteMutation):
                 "variant_media",
             )
         )
+        checkout_pks = list(
+            checkout_models.Checkout.objects.filter(
+                lines__variant_id__in=pks
+            ).values_list("pk", flat=True)
+        )
 
         response = super().perform_mutation(_root, info, ids, **data)
 
@@ -545,6 +562,9 @@ class ProductVariantBulkDelete(ModelBulkDeleteMutation):
         order_models.OrderLine.objects.filter(pk__in=line_pks).delete()
         if orders_id:
             recalculate_orders_task.delay(list(orders_id))
+
+        # update checkout quantity related to deleted lines
+        bulk_update_checkout_quantity(checkout_pks)
 
         # set new product default variant if any has been removed
         products = models.Product.objects.filter(

@@ -10,6 +10,8 @@ from graphene.types import InputObjectType
 
 from ....attribute import AttributeInputType, AttributeType
 from ....attribute import models as attribute_models
+from ....checkout import models as checkout_models
+from ....checkout.utils import bulk_update_checkout_quantity
 from ....core.exceptions import PermissionDenied
 from ....core.permissions import ProductPermissions, ProductTypePermissions
 from ....core.utils.editorjs import clean_editor_js
@@ -734,11 +736,21 @@ class ProductDelete(ModelDeleteMutation):
         ).values("pk", "order_id")
         line_pks = {line["pk"] for line in lines_id_and_orders_id}
         orders_id = {line["order_id"] for line in lines_id_and_orders_id}
+        checkout_pks = list(
+            checkout_models.Checkout.objects.filter(
+                lines__variant_id__in=variants_id
+            ).values_list("pk", flat=True)
+        )
+
         response = super().perform_mutation(_root, info, **data)
         # delete order lines for deleted variant
         order_models.OrderLine.objects.filter(pk__in=line_pks).delete()
         if orders_id:
             recalculate_orders_task.delay(list(orders_id))
+
+        # update checkout quantity related to deleted lines
+        bulk_update_checkout_quantity(checkout_pks)
+
         info.context.plugins.product_deleted(instance, variants_id)
 
         return response
@@ -1048,6 +1060,9 @@ class ProductVariantDelete(ModelDeleteMutation):
                 "channel_listings", "attributes__values", "variant_media"
             )
         ).get(id=instance.id)
+        checkout_pks = checkout_models.Checkout.objects.filter(
+            lines__variant_id=instance.pk
+        ).values_list("pk", flat=True)
 
         response = super().perform_mutation(_root, info, **data)
 
@@ -1055,6 +1070,9 @@ class ProductVariantDelete(ModelDeleteMutation):
         order_models.OrderLine.objects.filter(pk__in=line_pks).delete()
         if orders_id:
             recalculate_orders_task.delay(list(orders_id))
+
+        # update checkout quantity related to deleted lines
+        bulk_update_checkout_quantity(checkout_pks)
 
         transaction.on_commit(
             lambda: info.context.plugins.product_variant_deleted(variant)
